@@ -1369,15 +1369,13 @@ func (local *local) CollectLocalDuplicateRows(ctx context.Context, tbl table.Tab
 		logger.End(zap.ErrorLevel, err)
 	}()
 
-	//duplicateManager, err := NewDuplicateManager(local, tbl, tableName, opts)
-	//if err != nil {
-	//	return false, errors.Annotate(err, "open duplicate manager failed")
-	//}
-	//hasDupe, err = duplicateManager.CollectDuplicateRowsFromLocalIndex(ctx)
-	//if err != nil {
-	//	return false, errors.Annotate(err, "collect local duplicate rows failed")
-	//}
-	//return hasDupe, nil
+	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli, local.errorMgr, opts)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	if err := duplicateManager.CollectDuplicateRowsFromDupDB(ctx, local.duplicateDB, dupDetectKeyAdapter{}); err != nil {
+		return false, errors.Trace(err)
+	}
 	return false, nil
 }
 
@@ -1387,15 +1385,13 @@ func (local *local) CollectRemoteDuplicateRows(ctx context.Context, tbl table.Ta
 		logger.End(zap.ErrorLevel, err)
 	}()
 
-	//duplicateManager, err := NewDuplicateManager(local, tbl, tableName, opts)
-	//if err != nil {
-	//	return false, errors.Annotate(err, "open duplicate manager failed")
-	//}
-	//hasDupe, err = duplicateManager.CollectDuplicateRowsFromTiKV(ctx)
-	//if err != nil {
-	//	return false, errors.Annotate(err, "collect remote duplicate rows failed")
-	//}
-	//return hasDupe, nil
+	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli, local.errorMgr, opts)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	if err := duplicateManager.CollectDuplicateRowsFromTiKV(ctx, local.importClientFactory); err != nil {
+		return false, errors.Trace(err)
+	}
 	return false, nil
 }
 

@@ -17,7 +17,10 @@ package local
 import (
 	"bytes"
 	"context"
+	"github.com/pingcap/tidb/distsql"
+	"github.com/pingcap/tidb/util/ranger"
 	"io"
+	"math"
 	"sort"
 
 	"github.com/cockroachdb/pebble"
@@ -25,12 +28,17 @@ import (
 	"github.com/pingcap/kvproto/pkg/import_sstpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	pkgkv "github.com/pingcap/tidb/br/pkg/kv"
+	"github.com/pingcap/tidb/br/pkg/lightning/backend/kv"
 	"github.com/pingcap/tidb/br/pkg/lightning/errormanager"
 	"github.com/pingcap/tidb/br/pkg/lightning/log"
 	"github.com/pingcap/tidb/br/pkg/restore"
 	tidbkv "github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/hack"
+	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
@@ -178,7 +186,6 @@ type RemoteDupKVStream struct {
 	splitCli            restore.SplitClient
 	importClientFactory ImportClientFactory
 	keyRange            tidbkv.KeyRange
-	keyOnly             bool
 	dupKVCh             chan [2][]byte
 	atomicErr           atomic.Error
 	cancel              context.CancelFunc
@@ -189,14 +196,12 @@ func NewRemoteDupKVStream(
 	splitCli restore.SplitClient,
 	importClientFactory ImportClientFactory,
 	keyRange tidbkv.KeyRange,
-	keyOnly bool,
 ) (*RemoteDupKVStream, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &RemoteDupKVStream{
 		splitCli:            splitCli,
 		importClientFactory: importClientFactory,
 		keyRange:            keyRange,
-		keyOnly:             keyOnly,
 		dupKVCh:             make(chan [2][]byte, 16),
 		cancel:              cancel,
 		doneCh:              make(chan struct{}),
@@ -227,7 +232,6 @@ func (s *RemoteDupKVStream) getDupDetectClient(
 		Context:  reqCtx,
 		StartKey: startKey,
 		EndKey:   endKey,
-		KeyOnly:  s.keyOnly,
 	}
 	return importClient.DuplicateDetect(ctx, req)
 }
@@ -327,5 +331,206 @@ func (s *RemoteDupKVStream) Close() error {
 	return nil
 }
 
-type DuplicateCollector struct {
+type DuplicateManager struct {
+	tbl       table.Table
+	tableName string
+	splitCli  restore.SplitClient
+	tikvCli   *tikv.KVStore
+	errMgr    *errormanager.ErrorManager
+	decoder   *kv.TableKVDecoder
+	logger    log.Logger
+}
+
+func NewDuplicateManager(
+	tbl table.Table,
+	tableName string,
+	splitCli restore.SplitClient,
+	tikvCli *tikv.KVStore,
+	errMgr *errormanager.ErrorManager,
+	sessOpts *kv.SessionOptions,
+) (*DuplicateManager, error) {
+	decoder, err := kv.NewTableKVDecoder(tbl, tableName, sessOpts)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	logger := log.With(zap.String("tableName", tableName))
+	return &DuplicateManager{
+		tbl:       tbl,
+		tableName: tableName,
+		splitCli:  splitCli,
+		tikvCli:   tikvCli,
+		errMgr:    errMgr,
+		decoder:   decoder,
+		logger:    logger,
+	}, nil
+}
+
+func (m *DuplicateManager) RecordDataConflictError(ctx context.Context, stream DupKVStream) error {
+	defer stream.Close()
+	var dataConflictInfos []errormanager.DataConflictInfo
+	for {
+		key, val, err := stream.Next(ctx)
+		if errors.Cause(err) == io.EOF {
+			break
+		}
+		h, err := m.decoder.DecodeHandleFromRowKey(key)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		conflictInfo := errormanager.DataConflictInfo{
+			RawKey:   key,
+			RawValue: val,
+			KeyData:  h.String(),
+			Row:      m.decoder.DecodeRawRowDataAsStr(h, val),
+		}
+		dataConflictInfos = append(dataConflictInfos, conflictInfo)
+		if len(dataConflictInfos) >= 1024 {
+			if err := m.errMgr.RecordDataConflictError(ctx, m.logger, m.tableName, dataConflictInfos); err != nil {
+				return errors.Trace(err)
+			}
+			dataConflictInfos = dataConflictInfos[:0]
+		}
+	}
+	err := m.errMgr.RecordDataConflictError(ctx, m.logger, m.tableName, dataConflictInfos)
+	return errors.Trace(err)
+}
+
+func (m *DuplicateManager) saveIndexHandles(ctx context.Context, handles pendingIndexHandles) error {
+	snapshot := m.tikvCli.GetSnapshot(math.MaxUint64)
+	batchGetMap, err := snapshot.BatchGet(ctx, handles.rawHandles)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	rawRows := make([][]byte, 0, handles.Len())
+	for i, rawHandle := range handles.rawHandles {
+		rawValue, ok := batchGetMap[string(hack.String(rawHandle))]
+		if ok {
+			rawRows = append(rawRows, rawValue)
+			handles.dataConflictInfos[i].Row = m.decoder.DecodeRawRowDataAsStr(handles.handles[i], rawValue)
+		} else {
+			// TODO: add warn.
+		}
+	}
+	err = m.errMgr.RecordIndexConflictError(ctx, m.logger, m.tableName,
+		handles.indexNames, handles.dataConflictInfos, handles.rawHandles, rawRows)
+	return errors.Trace(err)
+}
+
+func (m *DuplicateManager) RecordIndexConflictError(ctx context.Context, stream DupKVStream, tableID int64, indexInfo *model.IndexInfo) error {
+	defer stream.Close()
+	indexHandles := makePendingIndexHandlesWithCapacity(0)
+	for {
+		key, val, err := stream.Next(ctx)
+		if errors.Cause(err) == io.EOF {
+			break
+		}
+		h, err := m.decoder.DecodeHandleFromIndex(indexInfo, key, val)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		conflictInfo := errormanager.DataConflictInfo{
+			RawKey:   key,
+			RawValue: val,
+			KeyData:  h.String(),
+		}
+		indexHandles.append(conflictInfo, indexInfo.Name.O,
+			h, tablecodec.EncodeRowKeyWithHandle(tableID, h))
+
+		if indexHandles.Len() >= 1024 {
+			if err := m.saveIndexHandles(ctx, indexHandles); err != nil {
+				return errors.Trace(err)
+			}
+			indexHandles.truncate()
+		}
+	}
+	err := m.saveIndexHandles(ctx, indexHandles)
+	return errors.Trace(err)
+}
+
+func (m *DuplicateManager) getAllHandleKeyRanges() ([]tidbkv.KeyRange, error) {
+	ranges := ranger.FullIntRange(false)
+	if m.tbl.Meta().IsCommonHandle {
+		ranges = ranger.FullRange()
+	}
+	tableIDs := physicalTableIDs(m.tbl.Meta())
+	return distsql.TableHandleRangesToKVRanges(nil, tableIDs, m.tbl.Meta().IsCommonHandle, ranges, nil)
+}
+
+func (m *DuplicateManager) getAllIndexKeyRanges(indexInfo *model.IndexInfo) ([]tidbkv.KeyRange, error) {
+	tableIDs := physicalTableIDs(m.tbl.Meta())
+	var keyRanges []tidbkv.KeyRange
+	for _, tid := range tableIDs {
+		partitionKeysRanges, err := distsql.IndexRangesToKVRanges(nil, tid, indexInfo.ID, ranger.FullRange(), nil)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		keyRanges = append(keyRanges, partitionKeysRanges...)
+	}
+	return keyRanges, nil
+}
+
+func (m *DuplicateManager) CollectDuplicateRowsFromDupDB(ctx context.Context, dupDB *pebble.DB, keyAdapter KeyAdapter) error {
+	handleKeyRanges, err := m.getAllHandleKeyRanges()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	for _, keyRange := range handleKeyRanges {
+		stream := NewLocalDupKVStream(dupDB, keyAdapter, keyRange)
+		if err := m.RecordDataConflictError(ctx, stream); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	for _, indexInfo := range m.tbl.Meta().Indices {
+		if indexInfo.State != model.StatePublic {
+			continue
+		}
+		keyRanges, err := m.getAllIndexKeyRanges(indexInfo)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		for _, keyRange := range keyRanges {
+			tableID := tablecodec.DecodeTableID(keyRange.StartKey)
+			stream := NewLocalDupKVStream(dupDB, keyAdapter, keyRange)
+			if err := m.RecordIndexConflictError(ctx, stream, tableID, indexInfo); err != nil {
+				return errors.Trace(err)
+			}
+		}
+	}
+	return nil
+}
+
+func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, importClientFactory ImportClientFactory) error {
+	handleKeyRanges, err := m.getAllHandleKeyRanges()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	for _, keyRange := range handleKeyRanges {
+		stream, err := NewRemoteDupKVStream(m.splitCli, importClientFactory, keyRange)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if err := m.RecordDataConflictError(ctx, stream); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	for _, indexInfo := range m.tbl.Meta().Indices {
+		if indexInfo.State != model.StatePublic {
+			continue
+		}
+		keyRanges, err := m.getAllIndexKeyRanges(indexInfo)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		for _, keyRange := range keyRanges {
+			tableID := tablecodec.DecodeTableID(keyRange.StartKey)
+			stream, err := NewRemoteDupKVStream(m.splitCli, importClientFactory, keyRange)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			if err := m.RecordIndexConflictError(ctx, stream, tableID, indexInfo); err != nil {
+				return errors.Trace(err)
+			}
+		}
+	}
+	return nil
 }
