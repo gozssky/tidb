@@ -17,13 +17,15 @@ package local
 import (
 	"bytes"
 	"context"
-	"github.com/pingcap/tidb/distsql"
-	"github.com/pingcap/tidb/util/ranger"
+	"github.com/pingcap/tidb/util/codec"
+	"golang.org/x/sync/semaphore"
 	"io"
 	"math"
 	"sort"
+	"sync"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/google/btree"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/import_sstpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
@@ -32,14 +34,14 @@ import (
 	"github.com/pingcap/tidb/br/pkg/lightning/errormanager"
 	"github.com/pingcap/tidb/br/pkg/lightning/log"
 	"github.com/pingcap/tidb/br/pkg/restore"
+	"github.com/pingcap/tidb/distsql"
 	tidbkv "github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/tablecodec"
-	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/hack"
+	"github.com/pingcap/tidb/util/ranger"
 	"github.com/tikv/client-go/v2/tikv"
-	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -132,6 +134,118 @@ func (indexHandles *pendingIndexHandles) searchSortedRawHandle(rawHandle []byte)
 	})
 }
 
+type pendingKeyRange tidbkv.KeyRange
+
+func (kr pendingKeyRange) Less(other btree.Item) bool {
+	return bytes.Compare(kr.EndKey, other.(pendingKeyRange).EndKey) < 0
+}
+
+type pendingKeyRanges struct {
+	mu   sync.Mutex
+	tree *btree.BTree
+}
+
+func buildTree(keyRanges []tidbkv.KeyRange) *btree.BTree {
+	tree := btree.New(32)
+	if len(keyRanges) == 0 {
+		return tree
+	}
+	sort.Slice(keyRanges, func(i, j int) bool {
+		return bytes.Compare(keyRanges[i].StartKey, keyRanges[j].StartKey) < 0
+	})
+	startKey := keyRanges[0].StartKey
+	endKey := keyRanges[0].EndKey
+	for _, kr := range keyRanges[1:] {
+		if bytes.Compare(kr.StartKey, endKey) > 0 {
+			tree.ReplaceOrInsert(
+				pendingKeyRange(tidbkv.KeyRange{
+					StartKey: startKey,
+					EndKey:   endKey,
+				}),
+			)
+			startKey = kr.StartKey
+			endKey = kr.EndKey
+		} else if bytes.Compare(kr.EndKey, endKey) > 0 {
+			endKey = kr.EndKey
+		}
+	}
+	tree.ReplaceOrInsert(
+		pendingKeyRange(tidbkv.KeyRange{
+			StartKey: startKey,
+			EndKey:   endKey,
+		}),
+	)
+	return tree
+}
+
+func newPendingKeyRanges(keyRanges ...tidbkv.KeyRange) *pendingKeyRanges {
+	return &pendingKeyRanges{tree: buildTree(keyRanges)}
+}
+
+func (p *pendingKeyRanges) list() []tidbkv.KeyRange {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var keyRanges []tidbkv.KeyRange
+	p.tree.Ascend(func(item btree.Item) bool {
+		keyRanges = append(keyRanges, tidbkv.KeyRange(item.(pendingKeyRange)))
+		return true
+	})
+	return keyRanges
+}
+
+func (p *pendingKeyRanges) empty() bool {
+	return p.tree.Min() == nil
+}
+
+func (p *pendingKeyRanges) finish(keyRange tidbkv.KeyRange) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var (
+		pendingAdd    []btree.Item
+		pendingRemove []btree.Item
+	)
+	startKey := keyRange.StartKey
+	endKey := keyRange.EndKey
+	p.tree.AscendGreaterOrEqual(
+		pendingKeyRange(tidbkv.KeyRange{EndKey: startKey}),
+		func(item btree.Item) bool {
+			kr := item.(pendingKeyRange)
+			if bytes.Compare(startKey, kr.EndKey) >= 0 {
+				return true
+			}
+			if bytes.Compare(endKey, kr.StartKey) <= 0 {
+				return false
+			}
+			pendingRemove = append(pendingRemove, kr)
+			if bytes.Compare(startKey, kr.StartKey) > 0 {
+				pendingAdd = append(pendingAdd,
+					pendingKeyRange(tidbkv.KeyRange{
+						StartKey: kr.StartKey,
+						EndKey:   startKey,
+					}),
+				)
+			}
+			if bytes.Compare(endKey, kr.EndKey) < 0 {
+				pendingAdd = append(pendingAdd,
+					pendingKeyRange(tidbkv.KeyRange{
+						StartKey: endKey,
+						EndKey:   kr.EndKey,
+					}),
+				)
+			}
+			return true
+		},
+	)
+	for _, item := range pendingRemove {
+		p.tree.Delete(item)
+	}
+	for _, item := range pendingAdd {
+		p.tree.ReplaceOrInsert(item)
+	}
+}
+
 // physicalTableIDs returns all physical table IDs associated with the tableInfo.
 // A partitioned table can have multiple physical table IDs.
 func physicalTableIDs(tableInfo *model.TableInfo) []int64 {
@@ -147,8 +261,32 @@ func physicalTableIDs(tableInfo *model.TableInfo) []int64 {
 	return []int64{tableInfo.ID}
 }
 
+// tableHandleKeyRanges returns all key ranges associated with the tableInfo.
+func tableHandleKeyRanges(tableInfo *model.TableInfo) ([]tidbkv.KeyRange, error) {
+	ranges := ranger.FullIntRange(false)
+	if tableInfo.IsCommonHandle {
+		ranges = ranger.FullRange()
+	}
+	tableIDs := physicalTableIDs(tableInfo)
+	return distsql.TableHandleRangesToKVRanges(nil, tableIDs, tableInfo.IsCommonHandle, ranges, nil)
+}
+
+// tableIndexKeyRanges returns all key ranges associated with the tableInfo and indexInfo.
+func tableIndexKeyRanges(tableInfo *model.TableInfo, indexInfo *model.IndexInfo) ([]tidbkv.KeyRange, error) {
+	tableIDs := physicalTableIDs(tableInfo)
+	var keyRanges []tidbkv.KeyRange
+	for _, tid := range tableIDs {
+		partitionKeysRanges, err := distsql.IndexRangesToKVRanges(nil, tid, indexInfo.ID, ranger.FullRange(), nil)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		keyRanges = append(keyRanges, partitionKeysRanges...)
+	}
+	return keyRanges, nil
+}
+
 type DupKVStream interface {
-	Next(ctx context.Context) (key, val []byte, err error)
+	Next() (key, val []byte, err error)
 	Close() error
 }
 
@@ -162,11 +300,13 @@ func NewLocalDupKVStream(dupDB *pebble.DB, keyAdapter KeyAdapter, keyRange tidbk
 		LowerBound: keyRange.StartKey,
 		UpperBound: keyRange.EndKey,
 	}
-	return &LocalDupKVStream{iter: newDupDBIter(dupDB, keyAdapter, opts)}
+	iter := newDupDBIter(dupDB, keyAdapter, opts)
+	iter.First()
+	return &LocalDupKVStream{iter: iter}
 }
 
-func (s *LocalDupKVStream) Next(_ context.Context) (key, val []byte, err error) {
-	if !s.iter.Next() {
+func (s *LocalDupKVStream) Next() (key, val []byte, err error) {
+	if !s.iter.Valid() {
 		err = s.iter.Error()
 		if err == nil {
 			err = io.EOF
@@ -175,6 +315,7 @@ func (s *LocalDupKVStream) Next(_ context.Context) (key, val []byte, err error) 
 	}
 	key = append(key, s.iter.Key()...)
 	val = append(val, s.iter.Value()...)
+	s.iter.Next()
 	return
 }
 
@@ -183,43 +324,23 @@ func (s *LocalDupKVStream) Close() error {
 }
 
 type RemoteDupKVStream struct {
-	splitCli            restore.SplitClient
-	importClientFactory ImportClientFactory
-	keyRange            tidbkv.KeyRange
-	dupKVCh             chan [2][]byte
-	atomicErr           atomic.Error
-	cancel              context.CancelFunc
-	doneCh              chan struct{}
+	cli    import_sstpb.ImportSST_DuplicateDetectClient
+	kvs    []*import_sstpb.KvPair
+	atEOF  bool
+	cancel context.CancelFunc
 }
 
-func NewRemoteDupKVStream(
-	splitCli restore.SplitClient,
-	importClientFactory ImportClientFactory,
-	keyRange tidbkv.KeyRange,
-) (*RemoteDupKVStream, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &RemoteDupKVStream{
-		splitCli:            splitCli,
-		importClientFactory: importClientFactory,
-		keyRange:            keyRange,
-		dupKVCh:             make(chan [2][]byte, 16),
-		cancel:              cancel,
-		doneCh:              make(chan struct{}),
-	}
-	go s.dupDetectLoop(ctx)
-	return s, nil
-}
-
-func (s *RemoteDupKVStream) getDupDetectClient(
+func getDupDetectClient(
 	ctx context.Context,
 	region *restore.RegionInfo,
-	startKey, endKey []byte,
+	keyRange tidbkv.KeyRange,
+	importClientFactory ImportClientFactory,
 ) (import_sstpb.ImportSST_DuplicateDetectClient, error) {
 	leader := region.Leader
 	if leader == nil {
 		leader = region.Region.GetPeers()[0]
 	}
-	importClient, err := s.importClientFactory.Create(ctx, leader.GetStoreId())
+	importClient, err := importClientFactory.Create(ctx, leader.GetStoreId())
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -230,104 +351,58 @@ func (s *RemoteDupKVStream) getDupDetectClient(
 	}
 	req := &import_sstpb.DuplicateDetectRequest{
 		Context:  reqCtx,
-		StartKey: startKey,
-		EndKey:   endKey,
+		StartKey: keyRange.StartKey,
+		EndKey:   keyRange.EndKey,
 	}
 	return importClient.DuplicateDetect(ctx, req)
 }
 
-func (s *RemoteDupKVStream) dupDetect(ctx context.Context, region *restore.RegionInfo, startKey, endKey []byte) error {
-	if bytes.Compare(startKey, region.Region.StartKey) < 0 {
-		startKey = region.Region.StartKey
-	}
-	if len(region.Region.EndKey) > 0 && bytes.Compare(region.Region.EndKey, endKey) < 0 {
-		endKey = region.Region.EndKey
-	}
-	cli, err := s.getDupDetectClient(ctx, region, startKey, endKey)
+func NewRemoteDupKVStream(
+	region *restore.RegionInfo,
+	keyRange tidbkv.KeyRange,
+	importClientFactory ImportClientFactory,
+) (*RemoteDupKVStream, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cli, err := getDupDetectClient(ctx, region, keyRange, importClientFactory)
 	if err != nil {
-		return errors.Trace(err)
+		cancel()
+		return nil, errors.Trace(err)
 	}
-	for {
-		resp, err := cli.Recv()
-		if err != nil {
-			if errors.Cause(err) == io.EOF {
-				return nil
-			}
-			return errors.Trace(err)
-		}
-		if resp.KeyError != nil {
-			return errors.Errorf("meet key error in duplicate detect response: %s", resp.KeyError.Message)
-		}
-		for _, pair := range resp.Pairs {
-			select {
-			case s.dupKVCh <- [2][]byte{pair.Key, pair.Value}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
+	return &RemoteDupKVStream{cli: cli, cancel: cancel}, nil
 }
 
-func (s *RemoteDupKVStream) dupDetectLoop(ctx context.Context) {
-	defer close(s.doneCh)
-	defer close(s.dupKVCh)
-	startKey := codec.EncodeBytes([]byte{}, s.keyRange.StartKey)
-	endKey := codec.EncodeBytes([]byte{}, s.keyRange.EndKey)
-	for i := 0; i < maxRetryTimes; i++ {
-		regions, err := restore.PaginateScanRegion(ctx, s.splitCli, startKey, endKey, scanRegionLimit)
-		if err != nil {
-			if errors.Cause(err) == context.Canceled {
-				s.atomicErr.Store(errors.New("stream closed"))
-			} else {
-				s.atomicErr.Store(errors.Trace(err))
-			}
-			return
+func (s *RemoteDupKVStream) tryRecv() error {
+	resp, err := s.cli.Recv()
+	if err != nil {
+		if errors.Cause(err) == io.EOF {
+			s.atEOF = true
+			err = io.EOF
 		}
-		for _, region := range regions {
-			if err := s.dupDetect(ctx, region, startKey, endKey); err != nil {
-				if errors.Cause(err) == context.Canceled {
-					s.atomicErr.Store(errors.New("stream closed"))
-					return
-				}
-				log.L().Warn(
-					"failed to detect duplicates",
-					zap.Uint64("regionID", region.Region.GetId()),
-					zap.Error(err),
-				)
-				// TODO: check error and retry
-				break
-			}
-			if len(region.Region.StartKey) > 0 {
-				startKey = region.Region.StartKey
-			} else {
-				startKey = endKey
-			}
-		}
-		if bytes.Compare(startKey, endKey) >= 0 {
-			s.atomicErr.Store(io.EOF)
-			break
-		}
+		return err
 	}
+	if resp.KeyError != nil {
+		return errors.Errorf("meet key error in duplicate detect response: %s", resp.KeyError.Message)
+	}
+	s.kvs = resp.Pairs
+	return nil
 }
 
-func (s *RemoteDupKVStream) Next(ctx context.Context) (key, val []byte, err error) {
-	select {
-	case kvPair, ok := <-s.dupKVCh:
-		if ok {
-			key = kvPair[0]
-			val = kvPair[1]
-		} else {
-			err = s.atomicErr.Load()
+func (s *RemoteDupKVStream) Next() (key, val []byte, err error) {
+	if len(s.kvs) == 0 {
+		if s.atEOF {
+			return nil, nil, io.EOF
 		}
-	case <-ctx.Done():
-		err = ctx.Err()
+		if err := s.tryRecv(); err != nil {
+			return nil, nil, errors.Trace(err)
+		}
 	}
+	key, val = s.kvs[0].Key, s.kvs[0].Value
+	s.kvs = s.kvs[1:]
 	return
 }
 
 func (s *RemoteDupKVStream) Close() error {
 	s.cancel()
-	<-s.doneCh
 	return nil
 }
 
@@ -339,6 +414,8 @@ type DuplicateManager struct {
 	errMgr    *errormanager.ErrorManager
 	decoder   *kv.TableKVDecoder
 	logger    log.Logger
+
+	regionConcurrency int
 }
 
 func NewDuplicateManager(
@@ -369,7 +446,7 @@ func (m *DuplicateManager) RecordDataConflictError(ctx context.Context, stream D
 	defer stream.Close()
 	var dataConflictInfos []errormanager.DataConflictInfo
 	for {
-		key, val, err := stream.Next(ctx)
+		key, val, err := stream.Next()
 		if errors.Cause(err) == io.EOF {
 			break
 		}
@@ -420,7 +497,7 @@ func (m *DuplicateManager) RecordIndexConflictError(ctx context.Context, stream 
 	defer stream.Close()
 	indexHandles := makePendingIndexHandlesWithCapacity(0)
 	for {
-		key, val, err := stream.Next(ctx)
+		key, val, err := stream.Next()
 		if errors.Cause(err) == io.EOF {
 			break
 		}
@@ -447,30 +524,8 @@ func (m *DuplicateManager) RecordIndexConflictError(ctx context.Context, stream 
 	return errors.Trace(err)
 }
 
-func (m *DuplicateManager) getAllHandleKeyRanges() ([]tidbkv.KeyRange, error) {
-	ranges := ranger.FullIntRange(false)
-	if m.tbl.Meta().IsCommonHandle {
-		ranges = ranger.FullRange()
-	}
-	tableIDs := physicalTableIDs(m.tbl.Meta())
-	return distsql.TableHandleRangesToKVRanges(nil, tableIDs, m.tbl.Meta().IsCommonHandle, ranges, nil)
-}
-
-func (m *DuplicateManager) getAllIndexKeyRanges(indexInfo *model.IndexInfo) ([]tidbkv.KeyRange, error) {
-	tableIDs := physicalTableIDs(m.tbl.Meta())
-	var keyRanges []tidbkv.KeyRange
-	for _, tid := range tableIDs {
-		partitionKeysRanges, err := distsql.IndexRangesToKVRanges(nil, tid, indexInfo.ID, ranger.FullRange(), nil)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		keyRanges = append(keyRanges, partitionKeysRanges...)
-	}
-	return keyRanges, nil
-}
-
 func (m *DuplicateManager) CollectDuplicateRowsFromDupDB(ctx context.Context, dupDB *pebble.DB, keyAdapter KeyAdapter) error {
-	handleKeyRanges, err := m.getAllHandleKeyRanges()
+	handleKeyRanges, err := tableHandleKeyRanges(m.tbl.Meta())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -484,7 +539,7 @@ func (m *DuplicateManager) CollectDuplicateRowsFromDupDB(ctx context.Context, du
 		if indexInfo.State != model.StatePublic {
 			continue
 		}
-		keyRanges, err := m.getAllIndexKeyRanges(indexInfo)
+		keyRanges, err := tableIndexKeyRanges(m.tbl.Meta(), indexInfo)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -499,38 +554,127 @@ func (m *DuplicateManager) CollectDuplicateRowsFromDupDB(ctx context.Context, du
 	return nil
 }
 
-func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, importClientFactory ImportClientFactory) error {
-	handleKeyRanges, err := m.getAllHandleKeyRanges()
+type remoteDupTask struct {
+	tidbkv.KeyRange
+	tableID   int64
+	indexInfo *model.IndexInfo
+}
+
+// processRemoteDupTask collects remote duplicates within the given key range.
+// A key range is associated with multiple regions. collectRemoteDupByRange tries
+// to collect duplicates from each region. If the duplicates for a region are not
+// successfully collected, the corresponding key range will be sent to retryKeyRangeCh.
+func (m *DuplicateManager) processRemoteDupTask(
+	ctx context.Context,
+	task remoteDupTask,
+	importClientFactory ImportClientFactory,
+	taskCh chan<- remoteDupTask,
+	activeTasks *sync.WaitGroup,
+	concurrencyLimit *semaphore.Weighted,
+) error {
+	rawStartKey := codec.EncodeBytes(nil, task.StartKey)
+	rawEndKey := codec.EncodeBytes(nil, task.EndKey)
+	regions, err := restore.PaginateScanRegion(ctx, m.splitCli, rawStartKey, rawEndKey, 1024)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	for _, keyRange := range handleKeyRanges {
-		stream, err := NewRemoteDupKVStream(m.splitCli, importClientFactory, keyRange)
-		if err != nil {
-			return errors.Trace(err)
+	wg := &sync.WaitGroup{}
+	for _, region1 := range regions {
+		region := region1
+		// TODO: check error
+		_, startKey, _ := codec.DecodeBytes(nil, region.Region.StartKey)
+		_, endKey, _ := codec.DecodeBytes(nil, region.Region.EndKey)
+		if bytes.Compare(startKey, task.StartKey) < 0 {
+			startKey = task.StartKey
 		}
-		if err := m.RecordDataConflictError(ctx, stream); err != nil {
-			return errors.Trace(err)
+		if bytes.Compare(endKey, task.EndKey) > 0 {
+			endKey = task.EndKey
 		}
+		if bytes.Compare(startKey, endKey) >= 0 {
+			continue
+		}
+
+		wg.Add(1)
+		concurrencyLimit.Acquire(ctx, 1)
+		// TODO: comment.
+		activeTasks.Add(1)
+		go func() {
+			defer wg.Done()
+			defer concurrencyLimit.Release(1)
+
+			var err error
+			stream, err := NewRemoteDupKVStream(region, tidbkv.KeyRange{
+				StartKey: startKey,
+				EndKey:   endKey,
+			}, importClientFactory)
+			if err != nil {
+				// TODO: log
+				return
+			}
+			if task.indexInfo == nil {
+				m.RecordDataConflictError(ctx, stream)
+			} else {
+				m.RecordIndexConflictError(ctx, stream, task.tableID, task.indexInfo)
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
+}
+
+func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, importClientFactory ImportClientFactory) error {
+	var tasks []remoteDupTask
+	keyRanges, err := tableHandleKeyRanges(m.tbl.Meta())
+	if err != nil {
+		return errors.Trace(err)
+	}
+	for _, kr := range keyRanges {
+		tableID := tablecodec.DecodeTableID(kr.StartKey)
+		tasks = append(tasks, remoteDupTask{
+			KeyRange: kr,
+			tableID:  tableID,
+		})
 	}
 	for _, indexInfo := range m.tbl.Meta().Indices {
 		if indexInfo.State != model.StatePublic {
 			continue
 		}
-		keyRanges, err := m.getAllIndexKeyRanges(indexInfo)
+		keyRanges, err = tableIndexKeyRanges(m.tbl.Meta(), indexInfo)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		for _, keyRange := range keyRanges {
-			tableID := tablecodec.DecodeTableID(keyRange.StartKey)
-			stream, err := NewRemoteDupKVStream(m.splitCli, importClientFactory, keyRange)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			if err := m.RecordIndexConflictError(ctx, stream, tableID, indexInfo); err != nil {
-				return errors.Trace(err)
-			}
+		for _, kr := range keyRanges {
+			tableID := tablecodec.DecodeTableID(kr.StartKey)
+			tasks = append(tasks, remoteDupTask{
+				KeyRange:  kr,
+				tableID:   tableID,
+				indexInfo: indexInfo,
+			})
 		}
 	}
+
+	taskCh := make(chan remoteDupTask, len(tasks))
+	for _, task := range tasks {
+		taskCh <- task
+	}
+	regionLimit := semaphore.NewWeighted(int64(m.regionConcurrency))
+
+	wg := &sync.WaitGroup{}
+	activeTasks := &sync.WaitGroup{}
+	activeTasks.Add(len(tasks))
+	for i := 0; i < m.regionConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range taskCh {
+				m.processRemoteDupTask(ctx, task, importClientFactory, taskCh, activeTasks, regionLimit)
+				activeTasks.Done()
+			}
+		}()
+	}
+	activeTasks.Wait()
+	close(taskCh)
+	wg.Wait()
+
 	return nil
 }
