@@ -211,8 +211,8 @@ type local struct {
 	batchWriteKVPairs int
 	checkpointEnabled bool
 
-	tcpConcurrency int
-	maxOpenFiles   int
+	regionConcurrency int
+	maxOpenFiles      int
 
 	engineMemCacheSize      int
 	localWriterMemCacheSize int64
@@ -307,7 +307,7 @@ func NewLocalBackend(
 		localStoreDir:     localFile,
 		rangeConcurrency:  worker.NewPool(ctx, rangeConcurrency, "range"),
 		ingestConcurrency: worker.NewPool(ctx, rangeConcurrency*2, "ingest"),
-		tcpConcurrency:    rangeConcurrency,
+		regionConcurrency: rangeConcurrency,
 		batchWriteKVPairs: cfg.TikvImporter.SendKVPairs,
 		checkpointEnabled: cfg.Checkpoint.Enable,
 		maxOpenFiles:      utils.MaxInt(maxOpenFiles, openFilesLowerThreshold),
@@ -1369,7 +1369,7 @@ func (local *local) CollectLocalDuplicateRows(ctx context.Context, tbl table.Tab
 		logger.End(zap.ErrorLevel, err)
 	}()
 
-	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli, local.errorMgr, opts)
+	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli, local.errorMgr, opts, local.regionConcurrency)
 	if err != nil {
 		return false, errors.Trace(err)
 	}
@@ -1385,7 +1385,7 @@ func (local *local) CollectRemoteDuplicateRows(ctx context.Context, tbl table.Ta
 		logger.End(zap.ErrorLevel, err)
 	}()
 
-	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli, local.errorMgr, opts)
+	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli, local.errorMgr, opts, local.regionConcurrency)
 	if err != nil {
 		return false, errors.Trace(err)
 	}

@@ -304,14 +304,13 @@ func (s *RemoteDupKVStream) Close() error {
 }
 
 type DuplicateManager struct {
-	tbl       table.Table
-	tableName string
-	splitCli  restore.SplitClient
-	tikvCli   *tikv.KVStore
-	errMgr    *errormanager.ErrorManager
-	decoder   *kv.TableKVDecoder
-	logger    log.Logger
-
+	tbl               table.Table
+	tableName         string
+	splitCli          restore.SplitClient
+	tikvCli           *tikv.KVStore
+	errMgr            *errormanager.ErrorManager
+	decoder           *kv.TableKVDecoder
+	logger            log.Logger
 	regionConcurrency int
 }
 
@@ -322,6 +321,7 @@ func NewDuplicateManager(
 	tikvCli *tikv.KVStore,
 	errMgr *errormanager.ErrorManager,
 	sessOpts *kv.SessionOptions,
+	regionConcurrency int,
 ) (*DuplicateManager, error) {
 	decoder, err := kv.NewTableKVDecoder(tbl, tableName, sessOpts)
 	if err != nil {
@@ -329,13 +329,14 @@ func NewDuplicateManager(
 	}
 	logger := log.With(zap.String("tableName", tableName))
 	return &DuplicateManager{
-		tbl:       tbl,
-		tableName: tableName,
-		splitCli:  splitCli,
-		tikvCli:   tikvCli,
-		errMgr:    errMgr,
-		decoder:   decoder,
-		logger:    logger,
+		tbl:               tbl,
+		tableName:         tableName,
+		splitCli:          splitCli,
+		tikvCli:           tikvCli,
+		errMgr:            errMgr,
+		decoder:           decoder,
+		logger:            logger,
+		regionConcurrency: regionConcurrency,
 	}, nil
 }
 
