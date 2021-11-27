@@ -17,12 +17,11 @@ package local
 import (
 	"bytes"
 	"context"
-	"github.com/pingcap/tidb/util/codec"
-	"golang.org/x/sync/semaphore"
 	"io"
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/google/btree"
@@ -31,18 +30,22 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	pkgkv "github.com/pingcap/tidb/br/pkg/kv"
 	"github.com/pingcap/tidb/br/pkg/lightning/backend/kv"
+	"github.com/pingcap/tidb/br/pkg/lightning/common"
 	"github.com/pingcap/tidb/br/pkg/lightning/errormanager"
 	"github.com/pingcap/tidb/br/pkg/lightning/log"
+	"github.com/pingcap/tidb/br/pkg/logutil"
 	"github.com/pingcap/tidb/br/pkg/restore"
 	"github.com/pingcap/tidb/distsql"
 	tidbkv "github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
 )
 
 type pendingIndexHandles struct {
@@ -138,112 +141,6 @@ type pendingKeyRange tidbkv.KeyRange
 
 func (kr pendingKeyRange) Less(other btree.Item) bool {
 	return bytes.Compare(kr.EndKey, other.(pendingKeyRange).EndKey) < 0
-}
-
-type pendingKeyRanges struct {
-	mu   sync.Mutex
-	tree *btree.BTree
-}
-
-func buildTree(keyRanges []tidbkv.KeyRange) *btree.BTree {
-	tree := btree.New(32)
-	if len(keyRanges) == 0 {
-		return tree
-	}
-	sort.Slice(keyRanges, func(i, j int) bool {
-		return bytes.Compare(keyRanges[i].StartKey, keyRanges[j].StartKey) < 0
-	})
-	startKey := keyRanges[0].StartKey
-	endKey := keyRanges[0].EndKey
-	for _, kr := range keyRanges[1:] {
-		if bytes.Compare(kr.StartKey, endKey) > 0 {
-			tree.ReplaceOrInsert(
-				pendingKeyRange(tidbkv.KeyRange{
-					StartKey: startKey,
-					EndKey:   endKey,
-				}),
-			)
-			startKey = kr.StartKey
-			endKey = kr.EndKey
-		} else if bytes.Compare(kr.EndKey, endKey) > 0 {
-			endKey = kr.EndKey
-		}
-	}
-	tree.ReplaceOrInsert(
-		pendingKeyRange(tidbkv.KeyRange{
-			StartKey: startKey,
-			EndKey:   endKey,
-		}),
-	)
-	return tree
-}
-
-func newPendingKeyRanges(keyRanges ...tidbkv.KeyRange) *pendingKeyRanges {
-	return &pendingKeyRanges{tree: buildTree(keyRanges)}
-}
-
-func (p *pendingKeyRanges) list() []tidbkv.KeyRange {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var keyRanges []tidbkv.KeyRange
-	p.tree.Ascend(func(item btree.Item) bool {
-		keyRanges = append(keyRanges, tidbkv.KeyRange(item.(pendingKeyRange)))
-		return true
-	})
-	return keyRanges
-}
-
-func (p *pendingKeyRanges) empty() bool {
-	return p.tree.Min() == nil
-}
-
-func (p *pendingKeyRanges) finish(keyRange tidbkv.KeyRange) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var (
-		pendingAdd    []btree.Item
-		pendingRemove []btree.Item
-	)
-	startKey := keyRange.StartKey
-	endKey := keyRange.EndKey
-	p.tree.AscendGreaterOrEqual(
-		pendingKeyRange(tidbkv.KeyRange{EndKey: startKey}),
-		func(item btree.Item) bool {
-			kr := item.(pendingKeyRange)
-			if bytes.Compare(startKey, kr.EndKey) >= 0 {
-				return true
-			}
-			if bytes.Compare(endKey, kr.StartKey) <= 0 {
-				return false
-			}
-			pendingRemove = append(pendingRemove, kr)
-			if bytes.Compare(startKey, kr.StartKey) > 0 {
-				pendingAdd = append(pendingAdd,
-					pendingKeyRange(tidbkv.KeyRange{
-						StartKey: kr.StartKey,
-						EndKey:   startKey,
-					}),
-				)
-			}
-			if bytes.Compare(endKey, kr.EndKey) < 0 {
-				pendingAdd = append(pendingAdd,
-					pendingKeyRange(tidbkv.KeyRange{
-						StartKey: endKey,
-						EndKey:   kr.EndKey,
-					}),
-				)
-			}
-			return true
-		},
-	)
-	for _, item := range pendingRemove {
-		p.tree.Delete(item)
-	}
-	for _, item := range pendingAdd {
-		p.tree.ReplaceOrInsert(item)
-	}
 }
 
 // physicalTableIDs returns all physical table IDs associated with the tableInfo.
@@ -560,13 +457,15 @@ type remoteDupTask struct {
 	indexInfo *model.IndexInfo
 }
 
-// processRemoteDupTask collects remote duplicates within the given key range.
-// A key range is associated with multiple regions. collectRemoteDupByRange tries
+// processRemoteDupTask processes a remoteDupTask. A task contains a key range.
+// A key range is associated with multiple regions. processRemoteDupTask tries
 // to collect duplicates from each region. If the duplicates for a region are not
-// successfully collected, the corresponding key range will be sent to retryKeyRangeCh.
+// successfully collected, the corresponding key range will be wrapped into a new
+// task and send to the tashCh for later retry.
 func (m *DuplicateManager) processRemoteDupTask(
 	ctx context.Context,
 	task remoteDupTask,
+	logger log.Logger,
 	importClientFactory ImportClientFactory,
 	taskCh chan<- remoteDupTask,
 	activeTasks *sync.WaitGroup,
@@ -578,12 +477,21 @@ func (m *DuplicateManager) processRemoteDupTask(
 	if err != nil {
 		return errors.Trace(err)
 	}
+
 	wg := &sync.WaitGroup{}
-	for _, region1 := range regions {
-		region := region1
-		// TODO: check error
-		_, startKey, _ := codec.DecodeBytes(nil, region.Region.StartKey)
-		_, endKey, _ := codec.DecodeBytes(nil, region.Region.EndKey)
+	defer wg.Wait()
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for _, region := range regions {
+		region := region
+		_, startKey, err := codec.DecodeBytes(nil, region.Region.StartKey)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		_, endKey, err := codec.DecodeBytes(nil, region.Region.EndKey)
+		if err != nil {
+			return errors.Trace(err)
+		}
 		if bytes.Compare(startKey, task.StartKey) < 0 {
 			startKey = task.StartKey
 		}
@@ -594,31 +502,62 @@ func (m *DuplicateManager) processRemoteDupTask(
 			continue
 		}
 
+		logger := logger.With(
+			zap.Uint64("regionID", region.Region.Id),
+			logutil.Key("dupDetectStartKey", startKey),
+			logutil.Key("dupDetectEndKey", endKey),
+		)
+		logger.Debug("[detect-dupe] collect duplicate rows from region")
+
 		wg.Add(1)
-		concurrencyLimit.Acquire(ctx, 1)
-		// TODO: comment.
+		if err := concurrencyLimit.Acquire(subCtx, 1); err != nil {
+			return errors.Trace(err)
+		}
+		// We may add new task to taskCh if collecting duplicates fails.
+		// Increase activeTasks in advance to avoid losing the task.
 		activeTasks.Add(1)
 		go func() {
-			defer wg.Done()
-			defer concurrencyLimit.Release(1)
+			needRetry := false
+			defer func() {
+				// Release concurrencyLimit first to avoid deadlock that all
+				// goroutines are sending task to taskCh but no one actually processes the task.
+				concurrencyLimit.Release(1)
+				if needRetry {
+					time.Sleep(time.Second)
+					taskCh <- remoteDupTask{
+						KeyRange: tidbkv.KeyRange{
+							StartKey: startKey,
+							EndKey:   endKey,
+						},
+						tableID:   task.tableID,
+						indexInfo: task.indexInfo,
+					}
+				} else {
+					activeTasks.Done()
+				}
+				wg.Done()
+			}()
 
-			var err error
 			stream, err := NewRemoteDupKVStream(region, tidbkv.KeyRange{
 				StartKey: startKey,
 				EndKey:   endKey,
 			}, importClientFactory)
 			if err != nil {
-				// TODO: log
+				logger.Warn("[detect-dupe] failed to create remote duplicate kv stream", log.ShortError(err))
+				needRetry = true
 				return
 			}
 			if task.indexInfo == nil {
-				m.RecordDataConflictError(ctx, stream)
+				err = m.RecordDataConflictError(subCtx, stream)
 			} else {
-				m.RecordIndexConflictError(ctx, stream, task.tableID, task.indexInfo)
+				err = m.RecordIndexConflictError(subCtx, stream, task.tableID, task.indexInfo)
+			}
+			if err != nil {
+				logger.Warn("[detect-dupe] failed to record conflict error", log.ShortError(err))
+				needRetry = true
 			}
 		}()
 	}
-	wg.Wait()
 	return nil
 }
 
@@ -652,6 +591,8 @@ func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, imp
 			})
 		}
 	}
+	logger := m.logger
+	logger.Info("[detect-dupe] collect duplicate rows from tikv", zap.Int("keyRanges", len(tasks)))
 
 	taskCh := make(chan remoteDupTask, len(tasks))
 	for _, task := range tasks {
@@ -662,13 +603,46 @@ func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, imp
 	wg := &sync.WaitGroup{}
 	activeTasks := &sync.WaitGroup{}
 	activeTasks.Add(len(tasks))
+	var onceErr common.OnceError
 	for i := 0; i < m.regionConcurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for task := range taskCh {
-				m.processRemoteDupTask(ctx, task, importClientFactory, taskCh, activeTasks, regionLimit)
-				activeTasks.Done()
+				select {
+				case <-ctx.Done():
+					onceErr.Set(ctx.Err())
+					activeTasks.Done()
+					continue
+				default:
+				}
+				taskLogger := logger.With(
+					logutil.Key("startKey", task.StartKey),
+					logutil.Key("endKey", task.EndKey),
+					zap.Int64("tableID", task.tableID),
+				)
+				if task.indexInfo != nil {
+					taskLogger = taskLogger.With(
+						zap.String("indexName", task.indexInfo.Name.O),
+						zap.Int64("indexID", task.indexInfo.ID),
+					)
+				}
+				if err := m.processRemoteDupTask(ctx, task, taskLogger,
+					importClientFactory, taskCh, activeTasks, regionLimit); err != nil {
+					taskLogger.Warn("[detect-dupe] failed to process remoteDupTask", log.ShortError(err))
+					// Put task to taskCh again for later retry.
+					// Spawn a new goroutine to avoid deadlock that all goroutines
+					// are sending task to taskCh but no one actually processes the task.
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						// TODO: let sleep time configurable.
+						time.Sleep(time.Second)
+						taskCh <- task
+					}()
+				} else {
+					activeTasks.Done()
+				}
 			}
 		}()
 	}
@@ -676,5 +650,5 @@ func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, imp
 	close(taskCh)
 	wg.Wait()
 
-	return nil
+	return onceErr.Get()
 }
