@@ -589,9 +589,15 @@ func (m *DuplicateManager) splitLocalDupTaskByKeys(
 				tableID:   task.tableID,
 				indexInfo: task.indexInfo,
 			})
-			keys = 1
 			startKey = append([]byte{}, iter.Key()...)
+			keys = 1
 		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, errors.Trace(err)
+	}
+	if err := iter.Close(); err != nil {
+		return nil, errors.Trace(err)
 	}
 	if keys > 0 {
 		newDupTasks = append(newDupTasks, dupTask{
