@@ -169,10 +169,10 @@ func newDupDetectIter(ctx context.Context, db *pebble.DB, keyAdapter KeyAdapter,
 	opts *pebble.IterOptions, dupDB *pebble.DB, logger log.Logger) kv.Iter {
 	newOpts := &pebble.IterOptions{TableFilter: opts.TableFilter}
 	if len(opts.LowerBound) > 0 {
-		newOpts.LowerBound = keyAdapter.Encode(nil, opts.LowerBound, 0)
+		newOpts.LowerBound = keyAdapter.Encode(nil, opts.LowerBound, math.MinInt64)
 	}
 	if len(opts.UpperBound) > 0 {
-		newOpts.UpperBound = keyAdapter.Encode(nil, opts.UpperBound, math.MaxInt64)
+		newOpts.UpperBound = keyAdapter.Encode(nil, opts.UpperBound, math.MinInt64)
 	}
 	return &dupDetectIter{
 		ctx:        ctx,
@@ -255,10 +255,10 @@ var _ kv.Iter = &dupDBIter{}
 func newDupDBIter(dupDB *pebble.DB, keyAdapter KeyAdapter, opts *pebble.IterOptions) kv.Iter {
 	newOpts := &pebble.IterOptions{TableFilter: opts.TableFilter}
 	if len(opts.LowerBound) > 0 {
-		newOpts.LowerBound = keyAdapter.Encode(nil, opts.LowerBound, 0)
+		newOpts.LowerBound = keyAdapter.Encode(nil, opts.LowerBound, math.MinInt64)
 	}
 	if len(opts.UpperBound) > 0 {
-		newOpts.UpperBound = keyAdapter.Encode(nil, opts.UpperBound, math.MaxInt64)
+		newOpts.UpperBound = keyAdapter.Encode(nil, opts.UpperBound, math.MinInt64)
 	}
 	return &dupDBIter{
 		iter:       dupDB.NewIter(newOpts),
