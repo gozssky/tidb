@@ -450,8 +450,12 @@ func (m *DuplicateManager) RecordDataConflictError(ctx context.Context, stream D
 			dataConflictInfos = dataConflictInfos[:0]
 		}
 	}
-	err := m.errorMgr.RecordDataConflictError(ctx, m.logger, m.tableName, dataConflictInfos)
-	return errors.Trace(err)
+	if len(dataConflictInfos) > 0 {
+		if err := m.errorMgr.RecordDataConflictError(ctx, m.logger, m.tableName, dataConflictInfos); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
 }
 
 func (m *DuplicateManager) saveIndexHandles(ctx context.Context, handles pendingIndexHandles) error {
@@ -461,17 +465,18 @@ func (m *DuplicateManager) saveIndexHandles(ctx context.Context, handles pending
 		return errors.Trace(err)
 	}
 
-	rawRows := make([][]byte, 0, handles.Len())
+	rawRows := make([][]byte, handles.Len())
 	for i, rawHandle := range handles.rawHandles {
 		rawValue, ok := batchGetMap[string(hack.String(rawHandle))]
 		if ok {
-			rawRows = append(rawRows, rawValue)
+			rawRows[i] = rawValue
 			handles.dataConflictInfos[i].Row = m.decoder.DecodeRawRowDataAsStr(handles.handles[i], rawValue)
 		} else {
 			m.logger.Warn("[detect-dupe] can not found row data corresponding to the handle",
 				logutil.Key("rawHandle", rawHandle))
 		}
 	}
+
 	err = m.errorMgr.RecordIndexConflictError(ctx, m.logger, m.tableName,
 		handles.indexNames, handles.dataConflictInfos, handles.rawHandles, rawRows)
 	return errors.Trace(err)
@@ -509,8 +514,12 @@ func (m *DuplicateManager) RecordIndexConflictError(ctx context.Context, stream 
 			indexHandles.truncate()
 		}
 	}
-	err := m.saveIndexHandles(ctx, indexHandles)
-	return errors.Trace(err)
+	if indexHandles.Len() > 0 {
+		if err := m.saveIndexHandles(ctx, indexHandles); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
 }
 
 func (m *DuplicateManager) CollectDuplicateRowsFromDupDB(ctx context.Context, dupDB *pebble.DB, keyAdapter KeyAdapter) error {
