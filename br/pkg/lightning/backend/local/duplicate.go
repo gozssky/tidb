@@ -44,6 +44,7 @@ import (
 	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/tikv/client-go/v2/tikv"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
 )
@@ -141,6 +142,81 @@ type pendingKeyRange tidbkv.KeyRange
 
 func (kr pendingKeyRange) Less(other btree.Item) bool {
 	return bytes.Compare(kr.EndKey, other.(pendingKeyRange).EndKey) < 0
+}
+
+type pendingKeyRanges struct {
+	mu   sync.Mutex
+	tree *btree.BTree
+}
+
+func newPendingKeyRanges(keyRange tidbkv.KeyRange) *pendingKeyRanges {
+	tree := btree.New(32)
+	tree.ReplaceOrInsert(pendingKeyRange(keyRange))
+	return &pendingKeyRanges{tree: tree}
+}
+
+func (p *pendingKeyRanges) list() []tidbkv.KeyRange {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var keyRanges []tidbkv.KeyRange
+	p.tree.Ascend(func(item btree.Item) bool {
+		keyRanges = append(keyRanges, tidbkv.KeyRange(item.(pendingKeyRange)))
+		return true
+	})
+	return keyRanges
+}
+
+func (p *pendingKeyRanges) empty() bool {
+	return p.tree.Min() == nil
+}
+
+func (p *pendingKeyRanges) finish(keyRange tidbkv.KeyRange) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var (
+		pendingAdd    []btree.Item
+		pendingRemove []btree.Item
+	)
+	startKey := keyRange.StartKey
+	endKey := keyRange.EndKey
+	p.tree.AscendGreaterOrEqual(
+		pendingKeyRange(tidbkv.KeyRange{EndKey: startKey}),
+		func(item btree.Item) bool {
+			kr := item.(pendingKeyRange)
+			if bytes.Compare(startKey, kr.EndKey) >= 0 {
+				return true
+			}
+			if bytes.Compare(endKey, kr.StartKey) <= 0 {
+				return false
+			}
+			pendingRemove = append(pendingRemove, kr)
+			if bytes.Compare(startKey, kr.StartKey) > 0 {
+				pendingAdd = append(pendingAdd,
+					pendingKeyRange(tidbkv.KeyRange{
+						StartKey: kr.StartKey,
+						EndKey:   startKey,
+					}),
+				)
+			}
+			if bytes.Compare(endKey, kr.EndKey) < 0 {
+				pendingAdd = append(pendingAdd,
+					pendingKeyRange(tidbkv.KeyRange{
+						StartKey: endKey,
+						EndKey:   kr.EndKey,
+					}),
+				)
+			}
+			return true
+		},
+	)
+	for _, item := range pendingRemove {
+		p.tree.Delete(item)
+	}
+	for _, item := range pendingAdd {
+		p.tree.ReplaceOrInsert(item)
+	}
 }
 
 // physicalTableIDs returns all physical table IDs associated with the tableInfo.
@@ -312,6 +388,7 @@ type DuplicateManager struct {
 	decoder           *kv.TableKVDecoder
 	logger            log.Logger
 	regionConcurrency int
+	hasDupe           *atomic.Bool
 }
 
 func NewDuplicateManager(
@@ -322,6 +399,7 @@ func NewDuplicateManager(
 	errMgr *errormanager.ErrorManager,
 	sessOpts *kv.SessionOptions,
 	regionConcurrency int,
+	hasDupe *atomic.Bool,
 ) (*DuplicateManager, error) {
 	decoder, err := kv.NewTableKVDecoder(tbl, tableName, sessOpts)
 	if err != nil {
@@ -337,6 +415,7 @@ func NewDuplicateManager(
 		decoder:           decoder,
 		logger:            logger,
 		regionConcurrency: regionConcurrency,
+		hasDupe:           hasDupe,
 	}, nil
 }
 
@@ -348,6 +427,11 @@ func (m *DuplicateManager) RecordDataConflictError(ctx context.Context, stream D
 		if errors.Cause(err) == io.EOF {
 			break
 		}
+		if err != nil {
+			return errors.Trace(err)
+		}
+		m.hasDupe.Store(true)
+
 		h, err := m.decoder.DecodeHandleFromRowKey(key)
 		if err != nil {
 			return errors.Trace(err)
@@ -383,7 +467,8 @@ func (m *DuplicateManager) saveIndexHandles(ctx context.Context, handles pending
 			rawRows = append(rawRows, rawValue)
 			handles.dataConflictInfos[i].Row = m.decoder.DecodeRawRowDataAsStr(handles.handles[i], rawValue)
 		} else {
-			// TODO: add warn.
+			m.logger.Warn("[detect-dupe] can not found row data corresponding to the handle",
+				logutil.Key("rawHandle", rawHandle))
 		}
 	}
 	err = m.errMgr.RecordIndexConflictError(ctx, m.logger, m.tableName,
@@ -399,6 +484,11 @@ func (m *DuplicateManager) RecordIndexConflictError(ctx context.Context, stream 
 		if errors.Cause(err) == io.EOF {
 			break
 		}
+		if err != nil {
+			return errors.Trace(err)
+		}
+		m.hasDupe.Store(true)
+
 		h, err := m.decoder.DecodeHandleFromIndex(indexInfo, key, val)
 		if err != nil {
 			return errors.Trace(err)
@@ -458,108 +548,111 @@ type remoteDupTask struct {
 	indexInfo *model.IndexInfo
 }
 
+func (m *DuplicateManager) splitKeyRangeByRegions(
+	ctx context.Context, keyRange tidbkv.KeyRange,
+) ([]*restore.RegionInfo, []tidbkv.KeyRange, error) {
+	rawStartKey := codec.EncodeBytes(nil, keyRange.StartKey)
+	rawEndKey := codec.EncodeBytes(nil, keyRange.EndKey)
+	allRegions, err := restore.PaginateScanRegion(ctx, m.splitCli, rawStartKey, rawEndKey, 1024)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+	regions := make([]*restore.RegionInfo, 0, len(allRegions))
+	keyRanges := make([]tidbkv.KeyRange, 0, len(allRegions))
+	for _, region := range allRegions {
+		_, startKey, err := codec.DecodeBytes(region.Region.StartKey, nil)
+		if err != nil {
+			return nil, nil, errors.Trace(err)
+		}
+		_, endKey, err := codec.DecodeBytes(region.Region.EndKey, nil)
+		if err != nil {
+			return nil, nil, errors.Trace(err)
+		}
+		if bytes.Compare(startKey, keyRange.StartKey) < 0 {
+			startKey = keyRange.StartKey
+		}
+		if bytes.Compare(endKey, keyRange.EndKey) > 0 {
+			endKey = keyRange.EndKey
+		}
+		if bytes.Compare(startKey, endKey) < 0 {
+			regions = append(regions, region)
+			keyRanges = append(keyRanges, tidbkv.KeyRange{
+				StartKey: startKey,
+				EndKey:   endKey,
+			})
+		}
+	}
+	return regions, keyRanges, nil
+}
+
 // processRemoteDupTask processes a remoteDupTask. A task contains a key range.
 // A key range is associated with multiple regions. processRemoteDupTask tries
-// to collect duplicates from each region. If the duplicates for a region are not
-// successfully collected, the corresponding key range will be wrapped into a new
-// task and send to the tashCh for later retry.
+// to collect duplicates from each region. If the duplicates for some regions are
+// not successfully collected, return new tasks with the associated key ranges.
 func (m *DuplicateManager) processRemoteDupTask(
 	ctx context.Context,
 	task remoteDupTask,
 	logger log.Logger,
 	importClientFactory ImportClientFactory,
-	taskCh chan<- remoteDupTask,
-	activeTasks *sync.WaitGroup,
 	concurrencyLimit *semaphore.Weighted,
-) error {
-	rawStartKey := codec.EncodeBytes(nil, task.StartKey)
-	rawEndKey := codec.EncodeBytes(nil, task.EndKey)
-	regions, err := restore.PaginateScanRegion(ctx, m.splitCli, rawStartKey, rawEndKey, 1024)
+) (retryTasks []remoteDupTask) {
+	regions, keyRanges, err := m.splitKeyRangeByRegions(ctx, task.KeyRange)
 	if err != nil {
-		return errors.Trace(err)
+		logger.Warn("[detect-dupe] failed to split key range by regions", log.ShortError(err))
+		return append(retryTasks, task)
 	}
+	remainKeyRanges := newPendingKeyRanges(task.KeyRange)
 
 	wg := &sync.WaitGroup{}
-	defer wg.Wait()
-	subCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	for _, region := range regions {
-		region := region
-		_, startKey, err := codec.DecodeBytes(nil, region.Region.StartKey)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		_, endKey, err := codec.DecodeBytes(nil, region.Region.EndKey)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if bytes.Compare(startKey, task.StartKey) < 0 {
-			startKey = task.StartKey
-		}
-		if bytes.Compare(endKey, task.EndKey) > 0 {
-			endKey = task.EndKey
-		}
-		if bytes.Compare(startKey, endKey) >= 0 {
-			continue
-		}
+	for i := 0; i < len(regions); i++ {
+		region := regions[i]
+		kr := keyRanges[i]
 
-		logger := logger.With(
-			zap.Uint64("regionID", region.Region.Id),
-			logutil.Key("dupDetectStartKey", startKey),
-			logutil.Key("dupDetectEndKey", endKey),
-		)
-		logger.Debug("[detect-dupe] collect duplicate rows from region")
-
+		if err := concurrencyLimit.Acquire(ctx, 1); err != nil {
+			logger.Debug("[detect-dupe] stop processing task because context is done", log.ShortError(err))
+			break
+		}
 		wg.Add(1)
-		if err := concurrencyLimit.Acquire(subCtx, 1); err != nil {
-			return errors.Trace(err)
-		}
-		// We may add new task to taskCh if collecting duplicates fails.
-		// Increase activeTasks in advance to avoid losing the task.
-		activeTasks.Add(1)
 		go func() {
-			needRetry := false
 			defer func() {
-				// Release concurrencyLimit first to avoid deadlock that all
-				// goroutines are sending task to taskCh but no one actually processes the task.
 				concurrencyLimit.Release(1)
-				if needRetry {
-					time.Sleep(time.Second)
-					taskCh <- remoteDupTask{
-						KeyRange: tidbkv.KeyRange{
-							StartKey: startKey,
-							EndKey:   endKey,
-						},
-						tableID:   task.tableID,
-						indexInfo: task.indexInfo,
-					}
-				} else {
-					activeTasks.Done()
-				}
 				wg.Done()
 			}()
 
-			stream, err := NewRemoteDupKVStream(region, tidbkv.KeyRange{
-				StartKey: startKey,
-				EndKey:   endKey,
-			}, importClientFactory)
+			logger := logger.With(
+				zap.Uint64("regionID", region.Region.Id),
+				logutil.Key("dupDetectStartKey", kr.StartKey),
+				logutil.Key("dupDetectEndKey", kr.EndKey),
+			)
+			logger.Debug("[detect-dupe] collect duplicate rows from region")
+
+			stream, err := NewRemoteDupKVStream(region, kr, importClientFactory)
 			if err != nil {
 				logger.Warn("[detect-dupe] failed to create remote duplicate kv stream", log.ShortError(err))
-				needRetry = true
 				return
 			}
 			if task.indexInfo == nil {
-				err = m.RecordDataConflictError(subCtx, stream)
+				err = m.RecordDataConflictError(ctx, stream)
 			} else {
-				err = m.RecordIndexConflictError(subCtx, stream, task.tableID, task.indexInfo)
+				err = m.RecordIndexConflictError(ctx, stream, task.tableID, task.indexInfo)
 			}
 			if err != nil {
 				logger.Warn("[detect-dupe] failed to record conflict error", log.ShortError(err))
-				needRetry = true
+				return
 			}
+			remainKeyRanges.finish(kr)
 		}()
 	}
-	return nil
+	wg.Wait()
+
+	for _, kr := range remainKeyRanges.list() {
+		retryTasks = append(retryTasks, remoteDupTask{
+			KeyRange:  kr,
+			tableID:   task.tableID,
+			indexInfo: task.indexInfo,
+		})
+	}
+	return retryTasks
 }
 
 func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, importClientFactory ImportClientFactory) error {
@@ -628,9 +721,12 @@ func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, imp
 						zap.Int64("indexID", task.indexInfo.ID),
 					)
 				}
-				if err := m.processRemoteDupTask(ctx, task, taskLogger,
-					importClientFactory, taskCh, activeTasks, regionLimit); err != nil {
-					taskLogger.Warn("[detect-dupe] failed to process remoteDupTask", log.ShortError(err))
+				retryTasks := m.processRemoteDupTask(ctx, task, taskLogger, importClientFactory, regionLimit)
+				if len(retryTasks) > 0 {
+					taskLogger.Warn(
+						"[detect-dupe] remoteDupTask is not fully completed, retry new tasks",
+						zap.Int("retryTasks", len(retryTasks)),
+					)
 					// Put task to taskCh again for later retry.
 					// Spawn a new goroutine to avoid deadlock that all goroutines
 					// are sending task to taskCh but no one actually processes the task.
@@ -639,9 +735,14 @@ func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, imp
 						defer wg.Done()
 						// TODO: let sleep time configurable.
 						time.Sleep(time.Second)
-						taskCh <- task
+						for _, task := range retryTasks {
+							activeTasks.Add(1)
+							taskCh <- task
+						}
+						activeTasks.Done()
 					}()
 				} else {
+					taskLogger.Info("[detect-dupe] remoteDupTask is processed successfully")
 					activeTasks.Done()
 				}
 			}

@@ -1369,14 +1369,16 @@ func (local *local) CollectLocalDuplicateRows(ctx context.Context, tbl table.Tab
 		logger.End(zap.ErrorLevel, err)
 	}()
 
-	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli, local.errorMgr, opts, local.regionConcurrency)
+	atomicHasDupe := atomic.NewBool(false)
+	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli,
+		local.errorMgr, opts, local.regionConcurrency, atomicHasDupe)
 	if err != nil {
 		return false, errors.Trace(err)
 	}
 	if err := duplicateManager.CollectDuplicateRowsFromDupDB(ctx, local.duplicateDB, dupDetectKeyAdapter{}); err != nil {
 		return false, errors.Trace(err)
 	}
-	return false, nil
+	return atomicHasDupe.Load(), nil
 }
 
 func (local *local) CollectRemoteDuplicateRows(ctx context.Context, tbl table.Table, tableName string, opts *kv.SessionOptions) (hasDupe bool, err error) {
@@ -1385,14 +1387,16 @@ func (local *local) CollectRemoteDuplicateRows(ctx context.Context, tbl table.Ta
 		logger.End(zap.ErrorLevel, err)
 	}()
 
-	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli, local.errorMgr, opts, local.regionConcurrency)
+	atomicHasDupe := atomic.NewBool(false)
+	duplicateManager, err := NewDuplicateManager(tbl, tableName, local.splitCli, local.tikvCli,
+		local.errorMgr, opts, local.regionConcurrency, atomicHasDupe)
 	if err != nil {
 		return false, errors.Trace(err)
 	}
 	if err := duplicateManager.CollectDuplicateRowsFromTiKV(ctx, local.importClientFactory); err != nil {
 		return false, errors.Trace(err)
 	}
-	return false, nil
+	return atomicHasDupe.Load(), nil
 }
 
 func (local *local) ResolveDuplicateRows(ctx context.Context, tbl table.Table, tableName string, algorithm config.DuplicateResolutionAlgorithm) (err error) {
