@@ -46,6 +46,7 @@ import (
 	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -522,40 +523,129 @@ func (m *DuplicateManager) RecordIndexConflictError(ctx context.Context, stream 
 	return nil
 }
 
-func (m *DuplicateManager) CollectDuplicateRowsFromDupDB(ctx context.Context, dupDB *pebble.DB, keyAdapter KeyAdapter) error {
-	handleKeyRanges, err := tableHandleKeyRanges(m.tbl.Meta())
+type dupTask struct {
+	tidbkv.KeyRange
+	tableID   int64
+	indexInfo *model.IndexInfo
+}
+
+func (m *DuplicateManager) buildDupTasks() ([]dupTask, error) {
+	var tasks []dupTask
+	keyRanges, err := tableHandleKeyRanges(m.tbl.Meta())
 	if err != nil {
-		return errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
-	for _, keyRange := range handleKeyRanges {
-		stream := NewLocalDupKVStream(dupDB, keyAdapter, keyRange)
-		if err := m.RecordDataConflictError(ctx, stream); err != nil {
-			return errors.Trace(err)
-		}
+	for _, kr := range keyRanges {
+		tableID := tablecodec.DecodeTableID(kr.StartKey)
+		tasks = append(tasks, dupTask{
+			KeyRange: kr,
+			tableID:  tableID,
+		})
 	}
 	for _, indexInfo := range m.tbl.Meta().Indices {
 		if indexInfo.State != model.StatePublic {
 			continue
 		}
-		keyRanges, err := tableIndexKeyRanges(m.tbl.Meta(), indexInfo)
+		keyRanges, err = tableIndexKeyRanges(m.tbl.Meta(), indexInfo)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		for _, kr := range keyRanges {
+			tableID := tablecodec.DecodeTableID(kr.StartKey)
+			tasks = append(tasks, dupTask{
+				KeyRange:  kr,
+				tableID:   tableID,
+				indexInfo: indexInfo,
+			})
+		}
+	}
+	return tasks, nil
+}
+
+// TODO: Use sizeProperties to split tasks.
+func (m *DuplicateManager) splitLocalDupTaskByKeys(
+	task dupTask,
+	dupDB *pebble.DB,
+	keyAdapter KeyAdapter,
+	keyThreshold int,
+) ([]dupTask, error) {
+	opts := &pebble.IterOptions{
+		LowerBound: task.StartKey,
+		UpperBound: task.EndKey,
+	}
+	var newDupTasks []dupTask
+	keys := 0
+	startKey := task.StartKey
+	iter := newDupDBIter(dupDB, keyAdapter, opts)
+	for iter.First(); iter.Valid(); iter.Next() {
+		keys++
+		if keys > keyThreshold {
+			endKey := append([]byte{}, iter.Value()...)
+			newDupTasks = append(newDupTasks, dupTask{
+				KeyRange: tidbkv.KeyRange{
+					StartKey: startKey,
+					EndKey:   endKey,
+				},
+				tableID:   task.tableID,
+				indexInfo: task.indexInfo,
+			})
+			keys = 1
+			startKey = append([]byte{}, iter.Key()...)
+		}
+	}
+	if keys > 0 {
+		newDupTasks = append(newDupTasks, dupTask{
+			KeyRange: tidbkv.KeyRange{
+				StartKey: startKey,
+				EndKey:   task.EndKey,
+			},
+			tableID:   task.tableID,
+			indexInfo: task.indexInfo,
+		})
+	}
+	return newDupTasks, nil
+}
+
+func (m *DuplicateManager) CollectDuplicateRowsFromDupDB(ctx context.Context, dupDB *pebble.DB, keyAdapter KeyAdapter) error {
+	tasks, err := m.buildDupTasks()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	var newTasks []dupTask
+	for _, task := range tasks {
+		subTasks, err := m.splitLocalDupTaskByKeys(task, dupDB, keyAdapter, 1<<20)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		for _, keyRange := range keyRanges {
-			tableID := tablecodec.DecodeTableID(keyRange.StartKey)
-			stream := NewLocalDupKVStream(dupDB, keyAdapter, keyRange)
-			if err := m.RecordIndexConflictError(ctx, stream, tableID, indexInfo); err != nil {
-				return errors.Trace(err)
-			}
-		}
+		newTasks = append(newTasks, subTasks...)
 	}
-	return nil
-}
+	tasks = newTasks
 
-type remoteDupTask struct {
-	tidbkv.KeyRange
-	tableID   int64
-	indexInfo *model.IndexInfo
+	logger := m.logger
+	logger.Info("[detect-dupe] collect duplicate rows from local duplicate db", zap.Int("tasks", len(tasks)))
+
+	concurrencyLimit := semaphore.NewWeighted(int64(m.regionConcurrency))
+	g, gCtx := errgroup.WithContext(ctx)
+	for _, task := range tasks {
+		if err := concurrencyLimit.Acquire(gCtx, 1); err != nil {
+			logger.Debug("[detect-dupe] stop processing task because context is done", log.ShortError(err))
+			break
+		}
+		task := task
+		g.Go(func() error {
+			defer concurrencyLimit.Release(1)
+
+			stream := NewLocalDupKVStream(dupDB, keyAdapter, task.KeyRange)
+			var err error
+			if task.indexInfo == nil {
+				err = m.RecordDataConflictError(gCtx, stream)
+			} else {
+				err = m.RecordIndexConflictError(gCtx, stream, task.tableID, task.indexInfo)
+			}
+			return errors.Trace(err)
+		})
+	}
+	return errors.Trace(g.Wait())
 }
 
 func (m *DuplicateManager) splitKeyRangeByRegions(
@@ -601,11 +691,11 @@ func (m *DuplicateManager) splitKeyRangeByRegions(
 // not successfully collected, return new tasks with the associated key ranges.
 func (m *DuplicateManager) processRemoteDupTask(
 	ctx context.Context,
-	task remoteDupTask,
+	task dupTask,
 	logger log.Logger,
 	importClientFactory ImportClientFactory,
 	concurrencyLimit *semaphore.Weighted,
-) (retryTasks []remoteDupTask) {
+) (retryTasks []dupTask) {
 	regions, keyRanges, err := m.splitKeyRangeByRegions(ctx, task.KeyRange)
 	if err != nil {
 		logger.Warn("[detect-dupe] failed to split key range by regions", log.ShortError(err))
@@ -656,7 +746,7 @@ func (m *DuplicateManager) processRemoteDupTask(
 	wg.Wait()
 
 	for _, kr := range remainKeyRanges.list() {
-		retryTasks = append(retryTasks, remoteDupTask{
+		retryTasks = append(retryTasks, dupTask{
 			KeyRange:  kr,
 			tableID:   task.tableID,
 			indexInfo: task.indexInfo,
@@ -666,39 +756,14 @@ func (m *DuplicateManager) processRemoteDupTask(
 }
 
 func (m *DuplicateManager) CollectDuplicateRowsFromTiKV(ctx context.Context, importClientFactory ImportClientFactory) error {
-	var tasks []remoteDupTask
-	keyRanges, err := tableHandleKeyRanges(m.tbl.Meta())
+	tasks, err := m.buildDupTasks()
 	if err != nil {
 		return errors.Trace(err)
 	}
-	for _, kr := range keyRanges {
-		tableID := tablecodec.DecodeTableID(kr.StartKey)
-		tasks = append(tasks, remoteDupTask{
-			KeyRange: kr,
-			tableID:  tableID,
-		})
-	}
-	for _, indexInfo := range m.tbl.Meta().Indices {
-		if indexInfo.State != model.StatePublic {
-			continue
-		}
-		keyRanges, err = tableIndexKeyRanges(m.tbl.Meta(), indexInfo)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		for _, kr := range keyRanges {
-			tableID := tablecodec.DecodeTableID(kr.StartKey)
-			tasks = append(tasks, remoteDupTask{
-				KeyRange:  kr,
-				tableID:   tableID,
-				indexInfo: indexInfo,
-			})
-		}
-	}
 	logger := m.logger
-	logger.Info("[detect-dupe] collect duplicate rows from tikv", zap.Int("keyRanges", len(tasks)))
+	logger.Info("[detect-dupe] collect duplicate rows from tikv", zap.Int("tasks", len(tasks)))
 
-	taskCh := make(chan remoteDupTask, len(tasks))
+	taskCh := make(chan dupTask, len(tasks))
 	for _, task := range tasks {
 		taskCh <- task
 	}
