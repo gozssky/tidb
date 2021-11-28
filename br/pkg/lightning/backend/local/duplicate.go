@@ -384,7 +384,7 @@ type DuplicateManager struct {
 	tableName         string
 	splitCli          restore.SplitClient
 	tikvCli           *tikv.KVStore
-	errMgr            *errormanager.ErrorManager
+	errorMgr          *errormanager.ErrorManager
 	decoder           *kv.TableKVDecoder
 	logger            log.Logger
 	regionConcurrency int
@@ -411,7 +411,7 @@ func NewDuplicateManager(
 		tableName:         tableName,
 		splitCli:          splitCli,
 		tikvCli:           tikvCli,
-		errMgr:            errMgr,
+		errorMgr:          errMgr,
 		decoder:           decoder,
 		logger:            logger,
 		regionConcurrency: regionConcurrency,
@@ -443,14 +443,14 @@ func (m *DuplicateManager) RecordDataConflictError(ctx context.Context, stream D
 			Row:      m.decoder.DecodeRawRowDataAsStr(h, val),
 		}
 		dataConflictInfos = append(dataConflictInfos, conflictInfo)
-		if len(dataConflictInfos) >= 1024 {
-			if err := m.errMgr.RecordDataConflictError(ctx, m.logger, m.tableName, dataConflictInfos); err != nil {
+		if len(dataConflictInfos) >= 10240 {
+			if err := m.errorMgr.RecordDataConflictError(ctx, m.logger, m.tableName, dataConflictInfos); err != nil {
 				return errors.Trace(err)
 			}
 			dataConflictInfos = dataConflictInfos[:0]
 		}
 	}
-	err := m.errMgr.RecordDataConflictError(ctx, m.logger, m.tableName, dataConflictInfos)
+	err := m.errorMgr.RecordDataConflictError(ctx, m.logger, m.tableName, dataConflictInfos)
 	return errors.Trace(err)
 }
 
@@ -460,6 +460,7 @@ func (m *DuplicateManager) saveIndexHandles(ctx context.Context, handles pending
 	if err != nil {
 		return errors.Trace(err)
 	}
+
 	rawRows := make([][]byte, 0, handles.Len())
 	for i, rawHandle := range handles.rawHandles {
 		rawValue, ok := batchGetMap[string(hack.String(rawHandle))]
@@ -471,7 +472,7 @@ func (m *DuplicateManager) saveIndexHandles(ctx context.Context, handles pending
 				logutil.Key("rawHandle", rawHandle))
 		}
 	}
-	err = m.errMgr.RecordIndexConflictError(ctx, m.logger, m.tableName,
+	err = m.errorMgr.RecordIndexConflictError(ctx, m.logger, m.tableName,
 		handles.indexNames, handles.dataConflictInfos, handles.rawHandles, rawRows)
 	return errors.Trace(err)
 }
@@ -501,7 +502,7 @@ func (m *DuplicateManager) RecordIndexConflictError(ctx context.Context, stream 
 		indexHandles.append(conflictInfo, indexInfo.Name.O,
 			h, tablecodec.EncodeRowKeyWithHandle(tableID, h))
 
-		if indexHandles.Len() >= 1024 {
+		if indexHandles.Len() >= 10240 {
 			if err := m.saveIndexHandles(ctx, indexHandles); err != nil {
 				return errors.Trace(err)
 			}
