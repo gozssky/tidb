@@ -74,6 +74,8 @@ type Metrics struct {
 	ChecksumSecondsHistogram             prometheus.Histogram
 	LocalStorageUsageBytesGauge          *prometheus.GaugeVec
 	ProgressGauge                        *prometheus.GaugeVec
+	ImportSendBytes                      prometheus.Counter
+	ImportRecvBytes                      prometheus.Counter
 }
 
 // NewMetrics creates a new empty metrics.
@@ -231,7 +233,21 @@ func NewMetrics(factory promutil.Factory) *Metrics {
 				Name:      "progress",
 				Help:      "progress of lightning phase",
 			}, []string{"phase"}),
+
+		ImportSendBytes: factory.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: "lightning",
+				Name:      "import_send_bytes",
+				Help:      "bytes sent to tikv when importing",
+			}),
+		ImportRecvBytes: factory.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: "lightning",
+				Name:      "import_recv_bytes",
+				Help:      "bytes received from tikv when importing",
+			}),
 	}
+
 }
 
 // RegisterTo registers all metrics to the given registry.

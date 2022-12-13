@@ -421,6 +421,8 @@ func (l *Lightning) run(taskCtx context.Context, taskCfg *config.Config, o *opti
 	metrics := metric.NewMetrics(o.promFactory)
 	metrics.RegisterTo(o.promRegistry)
 	defer func() {
+		fmt.Printf("sent bytes %v\n", int64(metric.ReadCounter(metrics.ImportSendBytes)))
+		fmt.Printf("recv bytes %v\n", int64(metric.ReadCounter(metrics.ImportRecvBytes)))
 		metrics.UnregisterFrom(o.promRegistry)
 	}()
 	l.metrics = metrics

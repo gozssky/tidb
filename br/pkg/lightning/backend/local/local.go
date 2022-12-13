@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,7 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/engine"
 	"github.com/pingcap/tidb/util/mathutil"
+	"github.com/prometheus/client_golang/prometheus"
 	tikverror "github.com/tikv/client-go/v2/error"
 	"github.com/tikv/client-go/v2/oracle"
 	tikvclient "github.com/tikv/client-go/v2/tikv"
@@ -75,6 +77,8 @@ import (
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
@@ -127,18 +131,32 @@ type ImportClientFactory interface {
 }
 
 type importClientFactoryImpl struct {
-	conns          *common.GRPCConns
-	splitCli       split.SplitClient
-	tls            *common.TLS
-	tcpConcurrency int
+	conns            *common.GRPCConns
+	splitCli         split.SplitClient
+	tls              *common.TLS
+	tcpConcurrency   int
+	compressionLevel int
+	sendCounter      prometheus.Counter
+	recvCounter      prometheus.Counter
 }
 
-func newImportClientFactoryImpl(splitCli split.SplitClient, tls *common.TLS, tcpConcurrency int) *importClientFactoryImpl {
+func newImportClientFactoryImpl(
+	splitCli split.SplitClient,
+	tls *common.TLS,
+	tcpConcurrency int,
+	compressionLevel int,
+	sendCounter prometheus.Counter,
+	recvCounter prometheus.Counter,
+) *importClientFactoryImpl {
+	gzip.SetLevel(compressionLevel)
 	return &importClientFactoryImpl{
-		conns:          common.NewGRPCConns(),
-		splitCli:       splitCli,
-		tls:            tls,
-		tcpConcurrency: tcpConcurrency,
+		conns:            common.NewGRPCConns(),
+		splitCli:         splitCli,
+		tls:              tls,
+		tcpConcurrency:   tcpConcurrency,
+		compressionLevel: compressionLevel,
+		sendCounter:      sendCounter,
+		recvCounter:      recvCounter,
 	}
 }
 
@@ -147,9 +165,11 @@ func (f *importClientFactoryImpl) makeConn(ctx context.Context, storeID uint64) 
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	opt := grpc.WithInsecure()
+	var opts []grpc.DialOption
 	if f.tls.TLSConfig() != nil {
-		opt = grpc.WithTransportCredentials(credentials.NewTLS(f.tls.TLSConfig()))
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(f.tls.TLSConfig())))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 
@@ -160,17 +180,25 @@ func (f *importClientFactoryImpl) makeConn(ctx context.Context, storeID uint64) 
 	if addr == "" {
 		addr = store.GetAddress()
 	}
-	conn, err := grpc.DialContext(
-		ctx,
-		addr,
-		opt,
+	opts = append(opts,
 		grpc.WithConnectParams(grpc.ConnectParams{Backoff: bfConf}),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                gRPCKeepAliveTime,
 			Timeout:             gRPCKeepAliveTimeout,
 			PermitWithoutStream: true,
 		}),
+		grpc.WithContextDialer(func(ctx context.Context, target string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", target)
+			if err != nil {
+				return nil, err
+			}
+			return &meteredConn{Conn: conn, sendCounter: f.sendCounter, recvCounter: f.recvCounter}, nil
+		}),
 	)
+	if f.compressionLevel != 0 {
+		opts = append(opts, grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)))
+	}
+	conn, err := grpc.DialContext(ctx, addr, opts...)
 	cancel()
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -195,6 +223,25 @@ func (f *importClientFactoryImpl) Create(ctx context.Context, storeID uint64) (s
 
 func (f *importClientFactoryImpl) Close() {
 	f.conns.Close()
+}
+
+type meteredConn struct {
+	net.Conn
+
+	sendCounter prometheus.Counter
+	recvCounter prometheus.Counter
+}
+
+func (c *meteredConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.recvCounter.Add(float64(n))
+	return n, err
+}
+
+func (c *meteredConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.sendCounter.Add(float64(n))
+	return n, err
 }
 
 // Range record start and end key for localStoreDir.DB
@@ -449,7 +496,9 @@ func NewLocalBackend(
 	if err != nil {
 		return backend.MakeBackend(nil), common.ErrCreateKVClient.Wrap(err).GenWithStackByArgs()
 	}
-	importClientFactory := newImportClientFactoryImpl(splitCli, tls, rangeConcurrency)
+
+	m, _ := metric.FromContext(ctx)
+	importClientFactory := newImportClientFactoryImpl(splitCli, tls, rangeConcurrency, cfg.TikvImporter.CompressionLevel, m.ImportSendBytes, m.ImportRecvBytes)
 	duplicateDetection := cfg.TikvImporter.DuplicateResolution != config.DupeResAlgNone
 	keyAdapter := KeyAdapter(noopKeyAdapter{})
 	if duplicateDetection {
