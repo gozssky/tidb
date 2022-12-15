@@ -555,6 +555,7 @@ type TikvImporter struct {
 	LocalWriterMemCacheSize ByteSize `toml:"local-writer-mem-cache-size" json:"local-writer-mem-cache-size"`
 	StoreWriteBWLimit       ByteSize `toml:"store-write-bwlimit" json:"store-write-bwlimit"`
 	CompressionLevel        int      `toml:"compression-level" json:"compression-level"`
+	PrefixCompression       bool     `toml:"prefix-compression" json:"prefix-compression"`
 }
 
 type Checkpoint struct {

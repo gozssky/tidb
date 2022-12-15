@@ -17,6 +17,7 @@ package local
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -413,6 +414,7 @@ type local struct {
 	engineMemCacheSize      int
 	localWriterMemCacheSize int64
 	supportMultiIngest      bool
+	enablePrefixCompression bool
 
 	checkTiKVAvaliable  bool
 	duplicateDetection  bool
@@ -540,6 +542,7 @@ func NewLocalBackend(
 		logger:                  log.FromContext(ctx),
 		encBuilder:              NewEncodingBuilder(ctx),
 		targetInfoGetter:        NewTargetInfoGetter(tls, g, cfg.TiDB.PdAddr),
+		enablePrefixCompression: cfg.TikvImporter.PrefixCompression,
 	}
 	if m, ok := metric.FromContext(ctx); ok {
 		local.metrics = m
@@ -1054,11 +1057,37 @@ func (local *local) WriteToTiKV(
 	flushLimit := int64(local.writeLimiter.Limit() / 10)
 
 	flushKVs := func() error {
+		batchPairs := pairs[:count]
+
+		if local.enablePrefixCompression {
+			commonPrefixLen := func(a, b []byte) uint64 {
+				i := 0
+				for ; i < len(a) && i < len(b); i++ {
+					if a[i] != b[i] {
+						break
+					}
+				}
+				return uint64(i)
+			}
+
+			for i := len(batchPairs) - 1; i > 0; i-- {
+				key1 := batchPairs[i-1].Key
+				key2 := batchPairs[i].Key
+				l := commonPrefixLen(key1, key2)
+				if l < 8 {
+					panic("commonPrefixLen < 8")
+				}
+				remain := key2[l:]
+				key2 = binary.AppendUvarint(key2[:0], l)
+				batchPairs[i].Key = append(key2, remain...)
+			}
+		}
+
 		for i := range clients {
 			if err := local.writeLimiter.WaitN(ctx, storeIDs[i], int(size)); err != nil {
 				return errors.Trace(err)
 			}
-			requests[i].Chunk.(*sst.WriteRequest_Batch).Batch.Pairs = pairs[:count]
+			requests[i].Chunk.(*sst.WriteRequest_Batch).Batch.Pairs = batchPairs
 			if err := clients[i].Send(requests[i]); err != nil {
 				return errors.Trace(err)
 			}
