@@ -42,6 +42,7 @@ import (
 	"github.com/pingcap/tidb/br/pkg/lightning/config"
 	"github.com/pingcap/tidb/br/pkg/lightning/errormanager"
 	"github.com/pingcap/tidb/br/pkg/lightning/glue"
+	"github.com/pingcap/tidb/br/pkg/lightning/importer"
 	"github.com/pingcap/tidb/br/pkg/lightning/log"
 	"github.com/pingcap/tidb/br/pkg/lightning/metric"
 	"github.com/pingcap/tidb/br/pkg/lightning/mydump"
@@ -1822,6 +1823,15 @@ func (tr *TableRestore) restoreTable(
 		return false, errors.Trace(err)
 	}
 
+	importCli, err := importer.NewClient("http://127.0.0.1:8287")
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+
+	tr.logger.Info("compacting")
+	compactErr := importCli.Compact(context.Background())
+	tr.logger.Info("compacted", zap.Error(compactErr))
+
 	err = metaMgr.UpdateTableStatus(ctx, metaStatusRestoreFinished)
 	if err != nil {
 		return false, errors.Trace(err)
@@ -2751,7 +2761,7 @@ func (cr *chunkRestore) restore(
 	ctx context.Context,
 	t *TableRestore,
 	engineID int32,
-	dataEngine, indexEngine *backend.LocalEngineWriter,
+	_, _ *backend.LocalEngineWriter,
 	rc *Controller,
 ) error {
 	// Create the encoder.
@@ -2772,10 +2782,40 @@ func (cr *chunkRestore) restore(
 
 	go func() {
 		defer close(deliverCompleteCh)
-		dur, err := cr.deliverLoop(ctx, kvsCh, t, engineID, dataEngine, indexEngine, rc)
+
+		logger := log.FromContext(ctx)
+		importCli, err := importer.NewClient("http://127.0.0.1:8287")
+		if err != nil {
+			logger.Fatal("failed to create importer client", zap.Error(err))
+		}
+
+		writer, err := importCli.NewWriter(context.Background())
+		if err != nil {
+			logger.Fatal("failed to create import writer", zap.Error(err))
+		}
+
+	loop:
+		for kvPacket := range kvsCh {
+			if len(kvPacket) == 0 {
+				break
+			}
+			for _, dkv := range kvPacket {
+				if dkv.kvs == nil {
+					break loop
+				}
+				kvPairs := kv.KvPairsFromRow(dkv.kvs)
+				for _, kvPair := range kvPairs {
+					if err := writer.Write(kvPair.Key, kvPair.Val); err != nil {
+						logger.Fatal("failed to write key-value pair to importer", zap.Error(err))
+					}
+				}
+			}
+		}
+		err = writer.Close()
+
 		select {
 		case <-ctx.Done():
-		case deliverCompleteCh <- deliverResult{dur, err}:
+		case deliverCompleteCh <- deliverResult{err: err}:
 		}
 	}()
 

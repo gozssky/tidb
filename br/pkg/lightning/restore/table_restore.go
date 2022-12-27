@@ -322,13 +322,13 @@ func (tr *TableRestore) restoreEngines(pCtx context.Context, rc *Controller, cp 
 				go func(w *worker.Worker, eid int32, ecp *checkpoints.EngineCheckpoint) {
 					defer wg.Done()
 					engineLogTask := tr.logger.With(zap.Int32("engineNumber", eid)).Begin(zap.InfoLevel, "restore engine")
-					dataClosedEngine, err := tr.restoreEngine(ctx, rc, indexEngine, eid, ecp)
+					_, err := tr.restoreEngine(ctx, rc, indexEngine, eid, ecp)
 					engineLogTask.End(zap.ErrorLevel, err)
 					rc.tableWorkers.Recycle(w)
 					if err == nil {
 						dataWorker := rc.closedEngineLimit.Apply()
 						defer rc.closedEngineLimit.Recycle(dataWorker)
-						err = tr.importEngine(ctx, dataClosedEngine, rc, eid, ecp)
+						//err = tr.importEngine(ctx, dataClosedEngine, rc, eid, ecp)
 						if rc.status != nil && rc.status.backend == config.BackendLocal {
 							for _, chunk := range ecp.Chunks {
 								rc.status.FinishedFileSize.Add(chunk.TotalSize())
